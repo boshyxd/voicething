@@ -4,3 +4,5 @@ sounddevice
 keyboard
 pyperclip
 python-dotenv
+pystray
+Pillow
