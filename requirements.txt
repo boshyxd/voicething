@@ -1,7 +1,7 @@
 deepgram-sdk>=5.0.0
 numpy
 sounddevice
-keyboard
+pynput
 pyperclip
 python-dotenv
 pystray

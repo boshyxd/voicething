@@ -7,7 +7,6 @@ import time
 import wave
 from pathlib import Path
 
-import keyboard
 import numpy as np
 import pystray
 import pyperclip
@@ -15,14 +14,26 @@ import sounddevice as sd
 from deepgram import DeepgramClient
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw
+from pynput import keyboard as pkeyboard
 
 load_dotenv()
 
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.3
 CHIME_DIR = Path(__file__).parent / "chimes"
-WIN_KEYS = {"left windows", "right windows"}
-CTRL_KEYS = {"left ctrl", "right ctrl", "ctrl"}
+IS_MACOS = sys.platform == "darwin"
+IS_WINDOWS = sys.platform.startswith("win")
+
+if IS_MACOS:
+    MOD1_KEYS = {pkeyboard.Key.alt, pkeyboard.Key.alt_l, pkeyboard.Key.alt_r}
+    MOD2_KEYS = {pkeyboard.Key.shift, pkeyboard.Key.shift_l, pkeyboard.Key.shift_r}
+    PASTE_MOD = pkeyboard.Key.cmd
+    HOTKEY_LABEL = "Option+Shift"
+else:
+    MOD1_KEYS = {pkeyboard.Key.cmd, pkeyboard.Key.cmd_l, pkeyboard.Key.cmd_r}
+    MOD2_KEYS = {pkeyboard.Key.ctrl, pkeyboard.Key.ctrl_l, pkeyboard.Key.ctrl_r}
+    PASTE_MOD = pkeyboard.Key.ctrl
+    HOTKEY_LABEL = "Win+Ctrl"
 
 _api_key = os.environ.get("DEEPGRAM_API_KEY")
 if not _api_key:
@@ -34,10 +45,12 @@ _recording = False
 _audio_frames: list[np.ndarray] = []
 _record_start = 0.0
 _stream: sd.InputStream | None = None
-_win_held = False
-_ctrl_held = False
+_mod1_held = False
+_mod2_held = False
 _clipboard_only = False
 _tray_icon: pystray.Icon | None = None
+_kb_controller = pkeyboard.Controller()
+_listener: pkeyboard.Listener | None = None
 
 
 def _generate_chimes():
@@ -107,6 +120,12 @@ def _stop_recording():
     threading.Thread(target=_transcribe_and_paste, args=(audio,), daemon=True).start()
 
 
+def _send_paste():
+    with _kb_controller.pressed(PASTE_MOD):
+        _kb_controller.press("v")
+        _kb_controller.release("v")
+
+
 def _transcribe_and_paste(audio: np.ndarray):
     buf = io.BytesIO()
     with wave.open(buf, "w") as wf:
@@ -122,29 +141,30 @@ def _transcribe_and_paste(audio: np.ndarray):
         return
     pyperclip.copy(transcript)
     if not _clipboard_only:
-        keyboard.send("ctrl+v")
+        _send_paste()
 
 
-def _on_key(event):
-    global _win_held, _ctrl_held
-    name = event.name.lower() if event.name else ""
-    is_win = name in WIN_KEYS
-    is_ctrl = name in CTRL_KEYS
-    if not is_win and not is_ctrl:
-        return
-    if event.event_type == "down":
-        if is_win:
-            _win_held = True
-        if is_ctrl:
-            _ctrl_held = True
-        if _win_held and _ctrl_held:
-            _start_recording()
+def _on_press(key):
+    global _mod1_held, _mod2_held
+    if key in MOD1_KEYS:
+        _mod1_held = True
+    elif key in MOD2_KEYS:
+        _mod2_held = True
     else:
-        if is_win:
-            _win_held = False
-        if is_ctrl:
-            _ctrl_held = False
-        _stop_recording()
+        return
+    if _mod1_held and _mod2_held:
+        _start_recording()
+
+
+def _on_release(key):
+    global _mod1_held, _mod2_held
+    if key in MOD1_KEYS:
+        _mod1_held = False
+    elif key in MOD2_KEYS:
+        _mod2_held = False
+    else:
+        return
+    _stop_recording()
 
 
 def _create_tray_icon(color=(100, 180, 255)):
@@ -161,7 +181,7 @@ def _toggle_mode(icon, _item):
     color = (220, 80, 80) if _clipboard_only else (100, 180, 255)
     icon.icon = _create_tray_icon(color)
     label = "Clipboard only" if _clipboard_only else "Type & paste"
-    icon.title = f"Voice Typer — {label}"
+    icon.title = f"Voice Typer ({HOTKEY_LABEL}) — {label}"
 
 
 def _notify(icon: pystray.Icon, message: str):
@@ -200,22 +220,22 @@ def _kill_processes(icon: pystray.Icon, *image_names: str):
 
 
 def _exit_app(icon: pystray.Icon, _item):
-    keyboard.unhook_all()
+    global _listener
+    if _listener is not None:
+        _listener.stop()
+        _listener = None
     icon.stop()
 
 
-def main():
-    _generate_chimes()
-    keyboard.hook(_on_key)
-    icon = pystray.Icon(
-        "voicething",
-        _create_tray_icon(),
-        "Voice Typer",
-        menu=pystray.Menu(
-            pystray.MenuItem(
-                lambda _item: "Mode: clipboard only" if _clipboard_only else "Mode: type & paste",
-                _toggle_mode,
-            ),
+def _build_menu():
+    items = [
+        pystray.MenuItem(
+            lambda _item: "Mode: clipboard only" if _clipboard_only else "Mode: type & paste",
+            _toggle_mode,
+        ),
+    ]
+    if IS_WINDOWS:
+        items.extend([
             pystray.MenuItem(
                 "End all node.exe",
                 lambda icon, _item: _kill_processes(icon, "node.exe"),
@@ -224,17 +244,52 @@ def main():
                 "End all bash/cat/date.exe",
                 lambda icon, _item: _kill_processes(icon, "bash.exe", "cat.exe", "date.exe"),
             ),
-            pystray.MenuItem("Exit", _exit_app),
-        ),
+        ])
+    items.append(pystray.MenuItem("Exit", _exit_app))
+    return pystray.Menu(*items)
+
+
+def _hide_dock_icon_macos():
+    try:
+        from AppKit import NSApplication
+        NSApplication.sharedApplication().setActivationPolicy_(1)
+    except Exception:
+        pass
+
+
+def main():
+    global _listener
+    if IS_MACOS:
+        _hide_dock_icon_macos()
+    _generate_chimes()
+    _listener = pkeyboard.Listener(on_press=_on_press, on_release=_on_release)
+    _listener.start()
+    icon = pystray.Icon(
+        "voicething",
+        _create_tray_icon(),
+        f"Voice Typer ({HOTKEY_LABEL})",
+        menu=_build_menu(),
     )
     icon.run()
 
 
 if __name__ == "__main__":
-    if sys.executable.endswith("python.exe"):
+    if IS_WINDOWS and sys.executable.endswith("python.exe"):
         subprocess.Popen(
             [sys.executable.replace("python.exe", "pythonw.exe")] + sys.argv,
             creationflags=subprocess.DETACHED_PROCESS,
+        )
+        sys.exit(0)
+    if IS_MACOS and os.environ.get("VOICETHING_DETACHED") != "1":
+        env = os.environ.copy()
+        env["VOICETHING_DETACHED"] = "1"
+        subprocess.Popen(
+            [sys.executable] + sys.argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
         )
         sys.exit(0)
     main()
