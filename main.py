@@ -20,6 +20,7 @@ load_dotenv()
 
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.3
+WINDOWS_TAIL_PADDING = 0.25
 CHIME_DIR = Path(__file__).parent / "chimes"
 IS_MACOS = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
@@ -109,14 +110,16 @@ def _stop_recording():
     if not _recording:
         return
     _recording = False
+    if IS_WINDOWS:
+        time.sleep(WINDOWS_TAIL_PADDING)
     _stream.stop()
     _stream.close()
     _stream = None
     elapsed = time.monotonic() - _record_start
     _play_chime("stop")
-    if elapsed < MIN_DURATION:
+    if elapsed < MIN_DURATION or not _audio_frames:
         return
-    audio = np.concatenate(_audio_frames)
+    audio = np.concatenate(list(_audio_frames))
     threading.Thread(target=_transcribe_and_paste, args=(audio,), daemon=True).start()
 
 
