@@ -244,8 +244,8 @@ def _build_menu():
                 lambda icon, _item: _kill_processes(icon, "node.exe"),
             ),
             pystray.MenuItem(
-                "End all bash/cat/date.exe",
-                lambda icon, _item: _kill_processes(icon, "bash.exe", "cat.exe", "date.exe"),
+                "End all bash/cat/date/grep.exe",
+                lambda icon, _item: _kill_processes(icon, "bash.exe", "cat.exe", "date.exe", "grep.exe"),
             ),
         ])
     items.append(pystray.MenuItem("Exit", _exit_app))
