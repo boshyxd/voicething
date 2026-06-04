@@ -229,6 +229,45 @@ def _kill_processes(icon: pystray.Icon, *image_names: str):
         _notify(icon, f"Failed to terminate: {', '.join(failed)}")
 
 
+def _kill_processes_except_self(icon: pystray.Icon, *image_names: str):
+    current_pid = os.getpid()
+    image_names_literal = ", ".join(f"'{name.lower()}'" for name in image_names)
+    ps_script = f"""
+$names = @({image_names_literal})
+$currentPid = {current_pid}
+$processes = Get-CimInstance Win32_Process |
+    Where-Object {{ $names -contains $_.Name.ToLowerInvariant() -and $_.ProcessId -ne $currentPid }}
+if (-not $processes) {{
+    exit 2
+}}
+$failed = @()
+foreach ($process in $processes) {{
+    try {{
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+    }} catch {{
+        $failed += $process.Name
+    }}
+}}
+if ($failed.Count -gt 0) {{
+    Write-Error ($failed -join ', ')
+    exit 1
+}}
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if result.returncode == 0:
+        _notify(icon, f"Terminated: {', '.join(image_names)}")
+    elif result.returncode == 2:
+        _notify(icon, "No running processes found.")
+    else:
+        failed = (result.stderr or "unknown error").strip()
+        _notify(icon, f"Failed to terminate: {failed}")
+
+
 def _exit_app(icon: pystray.Icon, _item):
     global _listener
     if _listener is not None:
@@ -253,6 +292,46 @@ def _build_menu():
             pystray.MenuItem(
                 "End all bash/cat/date/grep.exe",
                 lambda icon, _item: _kill_processes(icon, "bash.exe", "cat.exe", "date.exe", "grep.exe"),
+            ),
+            pystray.MenuItem(
+                "End all git/gh.exe",
+                lambda icon, _item: _kill_processes(
+                    icon,
+                    "git.exe",
+                    "gh.exe",
+                    "git-lfs.exe",
+                    "git-credential-manager.exe",
+                    "git-remote-http.exe",
+                    "git-remote-https.exe",
+                    "git-remote-ftp.exe",
+                    "git-remote-ftps.exe",
+                    "git-upload-pack.exe",
+                    "git-receive-pack.exe",
+                ),
+            ),
+            pystray.MenuItem(
+                "End all Python except this app",
+                lambda icon, _item: _kill_processes_except_self(
+                    icon,
+                    "python.exe",
+                    "pythonw.exe",
+                    "py.exe",
+                    "pyw.exe",
+                ),
+            ),
+            pystray.MenuItem(
+                "End all terminals",
+                lambda icon, _item: _kill_processes(
+                    icon,
+                    "OpenConsole.exe",
+                    "WindowsTerminal.exe",
+                    "terminal.exe",
+                    "wt.exe",
+                    "powershell.exe",
+                    "pwsh.exe",
+                    "conhost.exe",
+                    "ConsoleHost.exe",
+                ),
             ),
         ])
     items.append(pystray.MenuItem("Exit", _exit_app))
