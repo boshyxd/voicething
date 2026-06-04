@@ -110,17 +110,24 @@ def _stop_recording():
     if not _recording:
         return
     _recording = False
+    stream, frames, start = _stream, _audio_frames, _record_start
+    _stream = None
+    threading.Thread(
+        target=_finalize_recording, args=(stream, frames, start), daemon=True
+    ).start()
+
+
+def _finalize_recording(stream: sd.InputStream, frames: list[np.ndarray], start: float):
     if IS_WINDOWS:
         time.sleep(WINDOWS_TAIL_PADDING)
-    _stream.stop()
-    _stream.close()
-    _stream = None
-    elapsed = time.monotonic() - _record_start
+    stream.stop()
+    stream.close()
+    elapsed = time.monotonic() - start
     _play_chime("stop")
-    if elapsed < MIN_DURATION or not _audio_frames:
+    if elapsed < MIN_DURATION or not frames:
         return
-    audio = np.concatenate(list(_audio_frames))
-    threading.Thread(target=_transcribe_and_paste, args=(audio,), daemon=True).start()
+    audio = np.concatenate(list(frames))
+    _transcribe_and_paste(audio)
 
 
 def _send_paste():
