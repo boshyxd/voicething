@@ -1,5 +1,6 @@
 import io
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -36,6 +37,9 @@ else:
     PASTE_MOD = pkeyboard.Key.ctrl
     HOTKEY_LABEL = "Win+Ctrl"
 
+if IS_MACOS:
+    from AVFoundation import AVAudioEngine
+
 _api_key = os.environ.get("DEEPGRAM_API_KEY")
 if not _api_key:
     print("DEEPGRAM_API_KEY not set in .env", file=sys.stderr)
@@ -46,12 +50,15 @@ _recording = False
 _audio_frames: list[np.ndarray] = []
 _record_start = 0.0
 _stream: sd.InputStream | None = None
+_engine = AVAudioEngine.alloc().init() if IS_MACOS else None
+_capture_rate = SAMPLE_RATE
 _mod1_held = False
 _mod2_held = False
 _clipboard_only = False
 _tray_icon: pystray.Icon | None = None
 _kb_controller = pkeyboard.Controller()
 _listener: pkeyboard.Listener | None = None
+_audio_queue: queue.Queue[str] = queue.Queue()
 
 
 def _generate_chimes():
@@ -81,6 +88,9 @@ def _play_chime(name):
     path = CHIME_DIR / f"{name}.wav"
     if not path.exists():
         return
+    if IS_MACOS:
+        subprocess.Popen(["afplay", str(path)])
+        return
     with wave.open(str(path), "r") as wf:
         raw = wf.readframes(wf.getnframes())
     audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
@@ -91,15 +101,32 @@ def _audio_callback(indata, _frames, _time_info, _status):
     _audio_frames.append(indata.copy())
 
 
+def _tap_block(buf, _when):
+    n = int(buf.frameLength())
+    samples = np.frombuffer(buf.floatChannelData()[0].as_buffer(n), dtype=np.float32)
+    _audio_frames.append((np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16))
+
+
 def _start_recording():
-    global _recording, _record_start, _stream, _audio_frames
+    global _recording, _record_start, _stream, _audio_frames, _capture_rate
     if _recording:
         return
     _audio_frames = []
-    _stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, dtype="int16", callback=_audio_callback
-    )
-    _stream.start()
+    if IS_MACOS:
+        node = _engine.inputNode()
+        fmt = node.outputFormatForBus_(0)
+        _capture_rate = int(fmt.sampleRate())
+        node.installTapOnBus_bufferSize_format_block_(0, 1024, fmt, _tap_block)
+        ok, err = _engine.startAndReturnError_(None)
+        if not ok:
+            node.removeTapOnBus_(0)
+            raise RuntimeError(f"AVAudioEngine start failed: {err}")
+    else:
+        _capture_rate = SAMPLE_RATE
+        _stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="int16", callback=_audio_callback
+        )
+        _stream.start()
     _record_start = time.monotonic()
     _recording = True
     _play_chime("start")
@@ -110,24 +137,38 @@ def _stop_recording():
     if not _recording:
         return
     _recording = False
-    stream, frames, start = _stream, _audio_frames, _record_start
-    _stream = None
+    if IS_MACOS:
+        _engine.stop()
+        _engine.inputNode().removeTapOnBus_(0)
+    else:
+        stream = _stream
+        _stream = None
+        if IS_WINDOWS:
+            time.sleep(WINDOWS_TAIL_PADDING)
+        stream.stop()
+        stream.close()
+    elapsed = time.monotonic() - _record_start
+    _play_chime("stop")
+    if elapsed < MIN_DURATION or not _audio_frames:
+        return
+    audio = np.concatenate(list(_audio_frames))
     threading.Thread(
-        target=_finalize_recording, args=(stream, frames, start), daemon=True
+        target=_transcribe_and_paste, args=(audio, _capture_rate), daemon=True
     ).start()
 
 
-def _finalize_recording(stream: sd.InputStream, frames: list[np.ndarray], start: float):
-    if IS_WINDOWS:
-        time.sleep(WINDOWS_TAIL_PADDING)
-    stream.stop()
-    stream.close()
-    elapsed = time.monotonic() - start
-    _play_chime("stop")
-    if elapsed < MIN_DURATION or not frames:
-        return
-    audio = np.concatenate(list(frames))
-    _transcribe_and_paste(audio)
+# Audio capture start/stop must never run on the pynput event-tap thread and
+# must never run concurrently. PortAudio's CoreAudio backend deadlocks when
+# stream lifecycle calls race its property listeners (which is also why macOS
+# uses AVAudioEngine and afplay instead), freezing the tap and leaving the mic
+# stuck on.
+def _audio_worker():
+    while True:
+        command = _audio_queue.get()
+        if command == "start":
+            _start_recording()
+        elif command == "stop":
+            _stop_recording()
 
 
 def _send_paste():
@@ -136,12 +177,12 @@ def _send_paste():
         _kb_controller.release("v")
 
 
-def _transcribe_and_paste(audio: np.ndarray):
+def _transcribe_and_paste(audio: np.ndarray, samplerate: int):
     buf = io.BytesIO()
     with wave.open(buf, "w") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
+        wf.setframerate(samplerate)
         wf.writeframes(audio.tobytes())
     response = _client.listen.v1.media.transcribe_file(
         request=buf.getvalue(), model="nova-3", smart_format=True
@@ -163,7 +204,7 @@ def _on_press(key):
     else:
         return
     if _mod1_held and _mod2_held:
-        _start_recording()
+        _audio_queue.put("start")
 
 
 def _on_release(key):
@@ -174,7 +215,7 @@ def _on_release(key):
         _mod2_held = False
     else:
         return
-    _stop_recording()
+    _audio_queue.put("stop")
 
 
 def _create_tray_icon(color=(100, 180, 255)):
@@ -351,6 +392,7 @@ def main():
     if IS_MACOS:
         _hide_dock_icon_macos()
     _generate_chimes()
+    threading.Thread(target=_audio_worker, daemon=True).start()
     _listener = pkeyboard.Listener(on_press=_on_press, on_release=_on_release)
     _listener.start()
     icon = pystray.Icon(

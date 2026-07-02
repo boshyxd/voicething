@@ -6,3 +6,4 @@ pyperclip
 python-dotenv
 pystray
 Pillow
+pyobjc-framework-AVFoundation; sys_platform == "darwin"
