@@ -22,6 +22,9 @@ load_dotenv()
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.3
 WINDOWS_TAIL_PADDING = 0.25
+IDLE_TRAY_COLOR = (100, 180, 255)
+RECORDING_TRAY_COLOR = (70, 200, 100)
+CLIPBOARD_TRAY_COLOR = (220, 80, 80)
 CHIME_DIR = Path(__file__).parent / "chimes"
 IS_MACOS = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
@@ -129,6 +132,7 @@ def _start_recording():
         _stream.start()
     _record_start = time.monotonic()
     _recording = True
+    _refresh_tray_icon()
     _play_chime("start")
 
 
@@ -147,6 +151,7 @@ def _stop_recording():
             time.sleep(WINDOWS_TAIL_PADDING)
         stream.stop()
         stream.close()
+    _refresh_tray_icon()
     elapsed = time.monotonic() - _record_start
     _play_chime("stop")
     if elapsed < MIN_DURATION or not _audio_frames:
@@ -218,7 +223,7 @@ def _on_release(key):
     _audio_queue.put("stop")
 
 
-def _create_tray_icon(color=(100, 180, 255)):
+def _create_tray_icon(color=IDLE_TRAY_COLOR):
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -226,11 +231,23 @@ def _create_tray_icon(color=(100, 180, 255)):
     return img
 
 
+def _refresh_tray_icon(icon=None):
+    target = icon or _tray_icon
+    if target is None:
+        return
+    if _recording:
+        color = RECORDING_TRAY_COLOR
+    elif _clipboard_only:
+        color = CLIPBOARD_TRAY_COLOR
+    else:
+        color = IDLE_TRAY_COLOR
+    target.icon = _create_tray_icon(color)
+
+
 def _toggle_mode(icon, _item):
     global _clipboard_only
     _clipboard_only = not _clipboard_only
-    color = (220, 80, 80) if _clipboard_only else (100, 180, 255)
-    icon.icon = _create_tray_icon(color)
+    _refresh_tray_icon(icon)
     label = "Clipboard only" if _clipboard_only else "Type & paste"
     icon.title = f"Voice Typer ({HOTKEY_LABEL}) — {label}"
 
@@ -388,19 +405,20 @@ def _hide_dock_icon_macos():
 
 
 def main():
-    global _listener
+    global _listener, _tray_icon
     if IS_MACOS:
         _hide_dock_icon_macos()
-    _generate_chimes()
-    threading.Thread(target=_audio_worker, daemon=True).start()
-    _listener = pkeyboard.Listener(on_press=_on_press, on_release=_on_release)
-    _listener.start()
     icon = pystray.Icon(
         "voicething",
         _create_tray_icon(),
         f"Voice Typer ({HOTKEY_LABEL})",
         menu=_build_menu(),
     )
+    _tray_icon = icon
+    _generate_chimes()
+    threading.Thread(target=_audio_worker, daemon=True).start()
+    _listener = pkeyboard.Listener(on_press=_on_press, on_release=_on_release)
+    _listener.start()
     icon.run()
 
 
