@@ -45,8 +45,7 @@ if IS_MACOS:
 
 _api_key = os.environ.get("DEEPGRAM_API_KEY")
 if not _api_key:
-    print("DEEPGRAM_API_KEY not set in .env", file=sys.stderr)
-    sys.exit(1)
+    raise RuntimeError("DEEPGRAM_API_KEY not set in .env")
 
 _client = DeepgramClient(api_key=_api_key)
 _recording = False
