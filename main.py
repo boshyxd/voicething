@@ -1,4 +1,3 @@
-import io
 import os
 import queue
 import subprocess
@@ -13,6 +12,7 @@ import pystray
 import pyperclip
 import sounddevice as sd
 from deepgram import DeepgramClient
+from deepgram.extensions.types.sockets import ListenV1ControlMessage, ListenV1ResultsEvent
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 from pynput import keyboard as pkeyboard
@@ -49,7 +49,8 @@ if not _api_key:
 
 _client = DeepgramClient(api_key=_api_key)
 _recording = False
-_audio_frames: list[np.ndarray] = []
+_session: "_TranscriptionSession | None" = None
+_chimes: dict[str, np.ndarray] = {}
 _record_start = 0.0
 _stream: sd.InputStream | None = None
 _engine = AVAudioEngine.alloc().init() if IS_MACOS else None
@@ -86,38 +87,80 @@ def _generate_chimes():
             wf.writeframes(samples.tobytes())
 
 
+def _load_chimes():
+    for name in ("start", "stop"):
+        with wave.open(str(CHIME_DIR / f"{name}.wav"), "r") as wf:
+            raw = wf.readframes(wf.getnframes())
+        _chimes[name] = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
+
+
 def _play_chime(name):
-    path = CHIME_DIR / f"{name}.wav"
-    if not path.exists():
-        return
     if IS_MACOS:
-        subprocess.Popen(["afplay", str(path)])
+        subprocess.Popen(["afplay", str(CHIME_DIR / f"{name}.wav")])
         return
-    with wave.open(str(path), "r") as wf:
-        raw = wf.readframes(wf.getnframes())
-    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
-    sd.play(audio, SAMPLE_RATE)
+    sd.play(_chimes[name], SAMPLE_RATE, latency="low")
+
+
+# Streams audio to Deepgram while recording so the transcript is ready almost
+# as soon as the key is released, instead of uploading the whole clip after.
+class _TranscriptionSession:
+    def __init__(self, samplerate: int):
+        self._samplerate = samplerate
+        self._chunks: queue.Queue[bytes | None] = queue.Queue()
+        self._keep = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def feed(self, chunk: bytes):
+        self._chunks.put(chunk)
+
+    def finish(self, keep: bool):
+        self._keep = keep
+        self._chunks.put(None)
+
+    def _run(self):
+        parts: list[str] = []
+        with _client.listen.v1.connect(
+            model="nova-3",
+            encoding="linear16",
+            sample_rate=str(self._samplerate),
+            smart_format="true",
+        ) as sock:
+            reader = threading.Thread(target=_collect_final_transcripts, args=(sock, parts))
+            reader.start()
+            while (chunk := self._chunks.get()) is not None:
+                sock.send_media(chunk)
+            sock.send_control(ListenV1ControlMessage(type="CloseStream"))
+            reader.join()
+        if self._keep:
+            _deliver_transcript(" ".join(part for part in parts if part))
+
+
+def _collect_final_transcripts(sock, parts: list[str]):
+    for message in sock:
+        if isinstance(message, ListenV1ResultsEvent) and message.is_final:
+            parts.append(message.channel.alternatives[0].transcript)
 
 
 def _audio_callback(indata, _frames, _time_info, _status):
-    _audio_frames.append(indata.copy())
+    _session.feed(indata.tobytes())
 
 
 def _tap_block(buf, _when):
     n = int(buf.frameLength())
     samples = np.frombuffer(buf.floatChannelData()[0].as_buffer(n), dtype=np.float32)
-    _audio_frames.append((np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16))
+    _session.feed((np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
 
 
 def _start_recording():
-    global _recording, _record_start, _stream, _audio_frames, _capture_rate
+    global _recording, _record_start, _stream, _session, _capture_rate
     if _recording:
         return
-    _audio_frames = []
+    _play_chime("start")
     if IS_MACOS:
         node = _engine.inputNode()
         fmt = node.outputFormatForBus_(0)
         _capture_rate = int(fmt.sampleRate())
+        _session = _TranscriptionSession(_capture_rate)
         node.installTapOnBus_bufferSize_format_block_(0, 1024, fmt, _tap_block)
         ok, err = _engine.startAndReturnError_(None)
         if not ok:
@@ -125,6 +168,7 @@ def _start_recording():
             raise RuntimeError(f"AVAudioEngine start failed: {err}")
     else:
         _capture_rate = SAMPLE_RATE
+        _session = _TranscriptionSession(_capture_rate)
         _stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="int16", callback=_audio_callback
         )
@@ -132,7 +176,6 @@ def _start_recording():
     _record_start = time.monotonic()
     _recording = True
     _refresh_tray_icon()
-    _play_chime("start")
 
 
 def _stop_recording():
@@ -140,6 +183,9 @@ def _stop_recording():
     if not _recording:
         return
     _recording = False
+    _play_chime("stop")
+    _refresh_tray_icon()
+    elapsed = time.monotonic() - _record_start
     if IS_MACOS:
         _engine.stop()
         _engine.inputNode().removeTapOnBus_(0)
@@ -148,17 +194,11 @@ def _stop_recording():
         _stream = None
         if IS_WINDOWS:
             time.sleep(WINDOWS_TAIL_PADDING)
-        stream.stop()
+        # abort() returns in ~10ms; stop() waits ~400ms on MME draining buffers
+        # the tail padding has already collected.
+        stream.abort()
         stream.close()
-    _refresh_tray_icon()
-    elapsed = time.monotonic() - _record_start
-    _play_chime("stop")
-    if elapsed < MIN_DURATION or not _audio_frames:
-        return
-    audio = np.concatenate(list(_audio_frames))
-    threading.Thread(
-        target=_transcribe_and_paste, args=(audio, _capture_rate), daemon=True
-    ).start()
+    _session.finish(keep=elapsed >= MIN_DURATION)
 
 
 # Audio capture start/stop must never run on the pynput event-tap thread and
@@ -181,17 +221,7 @@ def _send_paste():
         _kb_controller.release("v")
 
 
-def _transcribe_and_paste(audio: np.ndarray, samplerate: int):
-    buf = io.BytesIO()
-    with wave.open(buf, "w") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(samplerate)
-        wf.writeframes(audio.tobytes())
-    response = _client.listen.v1.media.transcribe_file(
-        request=buf.getvalue(), model="nova-3", smart_format=True
-    )
-    transcript = response.results.channels[0].alternatives[0].transcript
+def _deliver_transcript(transcript: str):
     if not transcript.strip():
         return
     pyperclip.copy(transcript)
@@ -415,6 +445,7 @@ def main():
     )
     _tray_icon = icon
     _generate_chimes()
+    _load_chimes()
     threading.Thread(target=_audio_worker, daemon=True).start()
     _listener = pkeyboard.Listener(on_press=_on_press, on_release=_on_release)
     _listener.start()
