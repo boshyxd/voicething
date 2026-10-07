@@ -1,4 +1,4 @@
-deepgram-sdk>=5.0.0
+deepgram-sdk>=7.0.0
 numpy
 sounddevice
 pynput

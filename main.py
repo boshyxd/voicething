@@ -12,7 +12,7 @@ import pystray
 import pyperclip
 import sounddevice as sd
 from deepgram import DeepgramClient
-from deepgram.extensions.types.sockets import ListenV1ControlMessage, ListenV1ResultsEvent
+from deepgram.listen.v1 import ListenV1Results
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 from pynput import keyboard as pkeyboard
@@ -129,7 +129,7 @@ class _TranscriptionSession:
             reader.start()
             while (chunk := self._chunks.get()) is not None:
                 sock.send_media(chunk)
-            sock.send_control(ListenV1ControlMessage(type="CloseStream"))
+            sock.send_close_stream()
             reader.join()
         if self._keep:
             _deliver_transcript(" ".join(part for part in parts if part))
@@ -137,7 +137,7 @@ class _TranscriptionSession:
 
 def _collect_final_transcripts(sock, parts: list[str]):
     for message in sock:
-        if isinstance(message, ListenV1ResultsEvent) and message.is_final:
+        if isinstance(message, ListenV1Results) and message.is_final:
             parts.append(message.channel.alternatives[0].transcript)
 
 
