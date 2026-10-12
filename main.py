@@ -11,11 +11,11 @@ import numpy as np
 import pystray
 import pyperclip
 import sounddevice as sd
-from deepgram import DeepgramClient
-from deepgram.listen.v1 import ListenV1Results
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 from pynput import keyboard as pkeyboard
+
+from scribe import TranscriptionSession
 
 load_dotenv()
 
@@ -49,14 +49,13 @@ HOTKEY_KEYS = set().union(*(mod1 | mod2 for mod1, mod2 in HOTKEYS))
 if IS_MACOS:
     from AVFoundation import AVAudioEngine
 
-_api_key = os.environ.get("DEEPGRAM_API_KEY")
+_api_key = os.environ.get("ELEVENLABS_API_KEY")
 if not _api_key:
-    raise RuntimeError("DEEPGRAM_API_KEY not set in .env")
+    raise RuntimeError("ELEVENLABS_API_KEY not set in .env")
 
-_client = DeepgramClient(api_key=_api_key)
 _keyterms = [line.strip() for line in KEYTERMS_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
 _recording = False
-_session: "_TranscriptionSession | None" = None
+_session: TranscriptionSession | None = None
 _chimes: dict[str, np.ndarray] = {}
 _record_start = 0.0
 _stream: sd.InputStream | None = None
@@ -107,45 +106,8 @@ def _play_chime(name):
     sd.play(_chimes[name], SAMPLE_RATE, latency="low")
 
 
-# Streams audio to Deepgram while recording so the transcript is ready almost
-# as soon as the key is released, instead of uploading the whole clip after.
-class _TranscriptionSession:
-    def __init__(self, samplerate: int):
-        self._samplerate = samplerate
-        self._chunks: queue.Queue[bytes | None] = queue.Queue()
-        self._keep = False
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def feed(self, chunk: bytes):
-        self._chunks.put(chunk)
-
-    def finish(self, keep: bool):
-        self._keep = keep
-        self._chunks.put(None)
-
-    def _run(self):
-        parts: list[str] = []
-        with _client.listen.v1.connect(
-            model="nova-3",
-            encoding="linear16",
-            sample_rate=str(self._samplerate),
-            smart_format="true",
-            keyterm=_keyterms,
-        ) as sock:
-            reader = threading.Thread(target=_collect_final_transcripts, args=(sock, parts))
-            reader.start()
-            while (chunk := self._chunks.get()) is not None:
-                sock.send_media(chunk)
-            sock.send_close_stream()
-            reader.join()
-        if self._keep:
-            _deliver_transcript(" ".join(part for part in parts if part))
-
-
-def _collect_final_transcripts(sock, parts: list[str]):
-    for message in sock:
-        if isinstance(message, ListenV1Results) and message.is_final:
-            parts.append(message.channel.alternatives[0].transcript)
+def _create_session(samplerate: int) -> TranscriptionSession:
+    return TranscriptionSession(samplerate, _api_key, _keyterms, _deliver_transcript)
 
 
 def _audio_callback(indata, _frames, _time_info, _status):
@@ -167,7 +129,7 @@ def _start_recording():
         node = _engine.inputNode()
         fmt = node.outputFormatForBus_(0)
         _capture_rate = int(fmt.sampleRate())
-        _session = _TranscriptionSession(_capture_rate)
+        _session = _create_session(_capture_rate)
         node.installTapOnBus_bufferSize_format_block_(0, 1024, fmt, _tap_block)
         ok, err = _engine.startAndReturnError_(None)
         if not ok:
@@ -175,7 +137,7 @@ def _start_recording():
             raise RuntimeError(f"AVAudioEngine start failed: {err}")
     else:
         _capture_rate = SAMPLE_RATE
-        _session = _TranscriptionSession(_capture_rate)
+        _session = _create_session(_capture_rate)
         _stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="int16", callback=_audio_callback
         )
