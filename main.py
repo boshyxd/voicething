@@ -26,19 +26,25 @@ IDLE_TRAY_COLOR = (100, 180, 255)
 RECORDING_TRAY_COLOR = (70, 200, 100)
 CLIPBOARD_TRAY_COLOR = (220, 80, 80)
 CHIME_DIR = Path(__file__).parent / "chimes"
+KEYTERMS_PATH = Path(__file__).parent / "keyterms.txt"
 IS_MACOS = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
 
+ALT_KEYS = {pkeyboard.Key.alt, pkeyboard.Key.alt_l, pkeyboard.Key.alt_r}
+SHIFT_KEYS = {pkeyboard.Key.shift, pkeyboard.Key.shift_l, pkeyboard.Key.shift_r}
+CMD_KEYS = {pkeyboard.Key.cmd, pkeyboard.Key.cmd_l, pkeyboard.Key.cmd_r}
+CTRL_KEYS = {pkeyboard.Key.ctrl, pkeyboard.Key.ctrl_l, pkeyboard.Key.ctrl_r}
+
 if IS_MACOS:
-    MOD1_KEYS = {pkeyboard.Key.alt, pkeyboard.Key.alt_l, pkeyboard.Key.alt_r}
-    MOD2_KEYS = {pkeyboard.Key.shift, pkeyboard.Key.shift_l, pkeyboard.Key.shift_r}
+    # Cmd+Ctrl is what the PC's Win+Ctrl arrives as when typing on the Mac through Deskflow
+    HOTKEYS = [(ALT_KEYS, SHIFT_KEYS), (CMD_KEYS, CTRL_KEYS)]
     PASTE_MOD = pkeyboard.Key.cmd
-    HOTKEY_LABEL = "Option+Shift"
+    HOTKEY_LABEL = "Option+Shift / Cmd+Ctrl"
 else:
-    MOD1_KEYS = {pkeyboard.Key.cmd, pkeyboard.Key.cmd_l, pkeyboard.Key.cmd_r}
-    MOD2_KEYS = {pkeyboard.Key.ctrl, pkeyboard.Key.ctrl_l, pkeyboard.Key.ctrl_r}
+    HOTKEYS = [(CMD_KEYS, CTRL_KEYS)]
     PASTE_MOD = pkeyboard.Key.ctrl
     HOTKEY_LABEL = "Win+Ctrl"
+HOTKEY_KEYS = set().union(*(mod1 | mod2 for mod1, mod2 in HOTKEYS))
 
 if IS_MACOS:
     from AVFoundation import AVAudioEngine
@@ -48,6 +54,7 @@ if not _api_key:
     raise RuntimeError("DEEPGRAM_API_KEY not set in .env")
 
 _client = DeepgramClient(api_key=_api_key)
+_keyterms = [line.strip() for line in KEYTERMS_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
 _recording = False
 _session: "_TranscriptionSession | None" = None
 _chimes: dict[str, np.ndarray] = {}
@@ -55,8 +62,7 @@ _record_start = 0.0
 _stream: sd.InputStream | None = None
 _engine = AVAudioEngine.alloc().init() if IS_MACOS else None
 _capture_rate = SAMPLE_RATE
-_mod1_held = False
-_mod2_held = False
+_held_keys: set = set()
 _clipboard_only = False
 _tray_icon: pystray.Icon | None = None
 _kb_controller = pkeyboard.Controller()
@@ -124,6 +130,7 @@ class _TranscriptionSession:
             encoding="linear16",
             sample_rate=str(self._samplerate),
             smart_format="true",
+            keyterm=_keyterms,
         ) as sock:
             reader = threading.Thread(target=_collect_final_transcripts, args=(sock, parts))
             reader.start()
@@ -229,26 +236,22 @@ def _deliver_transcript(transcript: str):
         _send_paste()
 
 
+def _is_hotkey_held():
+    return any(_held_keys & mod1 and _held_keys & mod2 for mod1, mod2 in HOTKEYS)
+
+
 def _on_press(key):
-    global _mod1_held, _mod2_held
-    if key in MOD1_KEYS:
-        _mod1_held = True
-    elif key in MOD2_KEYS:
-        _mod2_held = True
-    else:
+    if key not in HOTKEY_KEYS:
         return
-    if _mod1_held and _mod2_held:
+    _held_keys.add(key)
+    if _is_hotkey_held():
         _audio_queue.put("start")
 
 
 def _on_release(key):
-    global _mod1_held, _mod2_held
-    if key in MOD1_KEYS:
-        _mod1_held = False
-    elif key in MOD2_KEYS:
-        _mod2_held = False
-    else:
+    if key not in HOTKEY_KEYS:
         return
+    _held_keys.discard(key)
     _audio_queue.put("stop")
 
 
