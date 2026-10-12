@@ -1,4 +1,4 @@
-websockets>=13
+deepgram-sdk>=7.0.0
 numpy
 sounddevice
 pynput
